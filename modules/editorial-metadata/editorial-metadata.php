@@ -68,9 +68,7 @@ class EF_Editorial_Metadata extends EF_Module {
 				),
 			'settings_help_sidebar' => __( '<p><strong>For more information:</strong></p><p><a href="http://editflow.org/features/editorial-metadata/">Editorial Metadata Documentation</a></p><p><a href="http://wordpress.org/tags/edit-flow?forum_id=10">Edit Flow Forum</a></p><p><a href="https://github.com/danielbachhuber/Edit-Flow">Edit Flow on Github</a></p>', 'edit-flow' ),
 		);
-		$edit_flow->register_module( $this->module_name, $args );		
-		
-		
+		EditFlow()->register_module( $this->module_name, $args );
 	}
 	
 	/**
@@ -80,6 +78,9 @@ class EF_Editorial_Metadata extends EF_Module {
 		
 		// Register the taxonomy we use for Editorial Metadata with WordPress core
 		$this->register_taxonomy();
+
+		// Anything that needs to happen in the admin
+		add_action( 'admin_init', array( $this, 'action_admin_init' ) );
 		
 		// Register our settings
 		add_action( 'admin_init', array( $this, 'register_settings' ) );		
@@ -98,7 +99,7 @@ class EF_Editorial_Metadata extends EF_Module {
 		// Add Editorial Metadata columns to the Manage Posts view
 		$supported_post_types = $this->get_post_types_for_module( $this->module );
 		foreach( $supported_post_types as $post_type ) {
-			add_action( "manage_{$post_type}_posts_columns", array( $this, 'filter_manage_posts_columns' ) );
+			add_filter( "manage_{$post_type}_posts_columns", array( $this, 'filter_manage_posts_columns' ) );
 			add_action( 'manage_posts_custom_column', array( $this, 'action_manage_posts_custom_column' ), 10, 2 );
 		}
 		
@@ -172,7 +173,23 @@ class EF_Editorial_Metadata extends EF_Module {
 			// Technically we've run this code before so we don't want to auto-install new data
 			$edit_flow->update_module_option( $this->module->name, 'loaded_once', true );
 		}
+		// Upgrade path to v0.7.4
+		if ( version_compare( $previous_version, '0.7.4', '<' ) ) {
+			// Editorial metadata descriptions become base64_encoded, instead of maybe json_encoded.
+			$this->upgrade_074_term_descriptions( self::metadata_taxonomy );
+		}
 		
+	}
+
+	/**
+	 * Anything that needs to happen on the 'admin_init' hook
+	 *
+	 * @since 0.7.4
+	 */
+	function action_admin_init() {
+
+		// Parse the query when we're ordering by an editorial metadata term
+		add_action( 'parse_query', array( $this, 'action_parse_query' ) );
 	}
 	
 	/**
@@ -519,9 +536,10 @@ class EF_Editorial_Metadata extends EF_Module {
 	 * Get all of the editorial metadata terms as objects and sort by position
 	 * @todo Figure out what we should do with the filter...
 	 * 
+	 * @param array $filter_args Filter to specific arguments
 	 * @return array $ordered_terms The terms as they should be ordered
 	 */ 
-	function get_editorial_metadata_terms() {
+	function get_editorial_metadata_terms( $filter_args = array() ) {
 
 		
 		$args = array(
@@ -565,6 +583,9 @@ class EF_Editorial_Metadata extends EF_Module {
 		// Append all of the terms that didn't have an existing position
 		foreach( $hold_to_end as $unpositioned_term )
 			$ordered_terms[] = $unpositioned_term;
+
+		// If filter arguments were passed, do our filtering
+		$ordered_terms = wp_filter_object_list( $ordered_terms, $filter_args );
 		return $ordered_terms;
 	}
 	
@@ -576,7 +597,6 @@ class EF_Editorial_Metadata extends EF_Module {
 	 */
 	function get_editorial_metadata_term_by( $field, $value ) {
 
-		
 		$term = get_term_by( $field, $value, self::metadata_taxonomy );
 		if ( ! $term || is_wp_error( $term ) )
 			return $term;
@@ -609,17 +629,52 @@ class EF_Editorial_Metadata extends EF_Module {
 	 * @param array $posts_columns Previous post columns with the new values
 	 */
 	function filter_manage_posts_columns( $posts_columns ) {
-		
-		$terms = $this->get_editorial_metadata_terms();
+		$screen = get_current_screen();
+
+		add_filter( "manage_{$screen->id}_sortable_columns", array( $this, 'filter_manage_posts_sortable_columns' ) );
+
+		$terms = $this->get_editorial_metadata_terms( array( 'viewable' => true ) );
 		foreach( $terms as $term ) {
-			// Don't show if the term isn't viewable
-			if ( !$term->viewable )
-				continue;
 			// Prefixing slug with module slug because it isn't stored prefixed and we want to avoid collisions
 			$key = $this->module->slug . '-' . $term->slug;
 			$posts_columns[$key] = $term->name;
 		}
 		return $posts_columns;
+	}
+
+	/**
+	 * Register any viewable date editorial metadata as a sortable column
+	 *
+	 * @since 0.7.4
+	 *
+	 * @param array $sortable_columns Any existing sortable columns (e.g. Title)
+	 * @return array $sortable_columms Sortable columns with editorial metadata date fields added
+	 */
+	function filter_manage_posts_sortable_columns( $sortable_columns ) {
+
+		$terms = $this->get_editorial_metadata_terms( array( 'viewable' => true, 'type' => 'date' ) );
+		foreach( $terms as $term ) {
+			// Prefixing slug with module slug because it isn't stored prefixed and we want to avoid collisions
+			$key = $this->module->slug . '-' . $term->slug;
+			$sortable_columns[$key] = $key;
+		}
+		return $sortable_columns;
+	}
+
+	/**
+	 * If we're ordering by a sortable column, let's modify the query
+	 *
+	 * @since 0.7.4
+	 */
+	function action_parse_query( $query ) {
+
+		if ( is_admin() && false !== stripos( get_query_var( 'orderby' ), $this->module->slug ) ) {
+			$term_slug = sanitize_key( str_replace( $this->module->slug . '-', '', get_query_var( 'orderby') ) );
+			$term = $this->get_editorial_metadata_term_by( 'slug', $term_slug );
+			$meta_key = $this->get_postmeta_key( $term );
+			set_query_var( 'meta_key', $meta_key );
+			set_query_var( 'orderby', 'meta_value_num' );
+		}
 	}
 	
 	/**
@@ -690,12 +745,10 @@ class EF_Editorial_Metadata extends EF_Module {
 		if ( !in_array( get_post_type( $post_id ), $this->get_post_types_for_module( $this->module ) ) )
 			return $calendar_fields;
 			
-		$terms = $this->get_editorial_metadata_terms();
+		$terms = $this->get_editorial_metadata_terms( array( 'viewable' => true ) );
 		
 		foreach( $terms as $term ) {
 			$key = $this->module->slug . '-' . $term->slug;
-			if ( !$term->viewable )
-				continue;
 
 			// Default values
 			$term_data = array(
@@ -750,11 +803,8 @@ class EF_Editorial_Metadata extends EF_Module {
 	 */
 	function filter_story_budget_term_columns( $term_columns ) {
 		
-		$terms = $this->get_editorial_metadata_terms();
+		$terms = $this->get_editorial_metadata_terms( array( 'viewable' => true ) );
 		foreach( $terms as $term ) {
-			// Don't show if the term isn't viewable
-			if ( !$term->viewable )
-				continue;
 			// Prefixing slug with module slug because it isn't stored prefixed and we want to avoid collisions
 			$key = $this->module->slug . '-' . $term->slug;
 			// Switch to underscores
@@ -987,9 +1037,9 @@ class EF_Editorial_Metadata extends EF_Module {
 		if ( $this->get_editorial_metadata_term_by( 'slug', $term_slug ) )
 			$_REQUEST['form-errors']['slug'] = __( 'Slug already in use. Please choose another.', 'edit-flow' );
 		// Check to make sure the status doesn't already exist as another term because otherwise we'd get a weird slug
-		// Check that the term name doesn't exceed 50 chars
-		if ( strlen( $term_name ) > 50 )
-			$_REQUEST['form-errors']['name'] = __( 'Name cannot exceed 50 characters. Please try a shorter name.', 'edit-flow' );
+		// Check that the term name doesn't exceed 200 chars
+		if ( strlen( $term_name ) > 200 )
+			$_REQUEST['form-errors']['name'] = __( 'Name cannot exceed 200 characters. Please try a shorter name.', 'edit-flow' );
 		// Metadata type needs to pass our whitelist check
 		$metadata_types = $this->get_supported_metadata_types();
 		if ( empty( $_POST['metadata_type'] ) || !isset( $metadata_types[$_POST['metadata_type'] ] ) )
@@ -1071,9 +1121,9 @@ class EF_Editorial_Metadata extends EF_Module {
 		if ( is_object( $search_term ) && $search_term->term_id != $existing_term->term_id )
 			$_REQUEST['form-errors']['name'] = __( 'Name conflicts with slug for another term. Please choose something else.', 'edit-flow' );					
 		
-		// Check that the term name doesn't exceed 50 chars
-		if ( strlen( $new_name ) > 50 )
-			$_REQUEST['form-errors']['name'] = __( 'Name cannot exceed 50 characters. Please try a shorter name.', 'edit-flow' );
+		// Check that the term name doesn't exceed 200 chars
+		if ( strlen( $new_name ) > 200 )
+			$_REQUEST['form-errors']['name'] = __( 'Name cannot exceed 200 characters. Please try a shorter name.', 'edit-flow' );
 		// Make sure the viewable state is valid
 		$new_viewable = false;
 		if ( $_POST['viewable'] == 'yes' )
@@ -1172,9 +1222,9 @@ class EF_Editorial_Metadata extends EF_Module {
 			die( $change_error->get_error_message() );
 		}
 		
-		// Check that the term name doesn't exceed 50 chars
-		if ( strlen( $metadata_name ) > 50 ) {
-			$change_error = new WP_Error( 'invalid', __( 'Name cannot exceed 50 characters. Please try a shorter name.' ) );
+		// Check that the term name doesn't exceed 200 chars
+		if ( strlen( $metadata_name ) > 200 ) {
+			$change_error = new WP_Error( 'invalid', __( 'Name cannot exceed 200 characters. Please try a shorter name.' ) );
 			die( $change_error->get_error_message() );
 		}
 		
@@ -1447,12 +1497,12 @@ class EF_Editorial_Metadata extends EF_Module {
 			<form class="add:the-list:" action="<?php echo esc_url( add_query_arg( array( 'page' => $this->module->settings_slug ), get_admin_url( null, 'admin.php' ) ) ); ?>" method="post" id="addmetadata" name="addmetadata">
 			<div class="form-field form-required">
 				<label for="metadata_name"><?php _e( 'Name', 'edit-flow' ); ?></label>
-				<input type="text" aria-required="true" size="20" maxlength="20" id="metadata_name" name="metadata_name" value="<?php if ( !empty( $_POST['metadata_name'] ) ) echo esc_attr( stripslashes( $_POST['metadata_name'] ) ) ?>" />
+				<input type="text" aria-required="true" size="20" maxlength="200" id="metadata_name" name="metadata_name" value="<?php if ( !empty( $_POST['metadata_name'] ) ) echo esc_attr( stripslashes( $_POST['metadata_name'] ) ) ?>" />
 				<?php $edit_flow->settings->helper_print_error_or_description( 'name', __( 'The name is for labeling the metadata field.', 'edit-flow' ) ); ?>
 			</div>
 			<div class="form-field form-required">
 				<label for="metadata_slug"><?php _e( 'Slug', 'edit-flow' ); ?></label>
-				<input type="text" aria-required="true" size="20" maxlength="20" id="metadata_slug" name="metadata_slug" value="<?php if ( !empty( $_POST['metadata_slug'] ) ) echo esc_attr( $_POST['metadata_slug'] ) ?>" />
+				<input type="text" aria-required="true" size="20" maxlength="200" id="metadata_slug" name="metadata_slug" value="<?php if ( !empty( $_POST['metadata_slug'] ) ) echo esc_attr( $_POST['metadata_slug'] ) ?>" />
 				<?php $edit_flow->settings->helper_print_error_or_description( 'slug', __( 'The "slug" is the URL-friendly version of the name. It is usually all lowercase and contains only letters, numbers, and hyphens.', 'edit-flow' ) ); ?>
 			</div>
 			<div class="form-field">
@@ -1673,7 +1723,7 @@ class EF_Editorial_Metadata_List_Table extends WP_List_Table {
 				<h4><?php _e( 'Quick Edit' ); ?></h4>
 				<label>
 					<span class="title"><?php _e( 'Name', 'edit-flow' ); ?></span>
-					<span class="input-text-wrap"><input type="text" name="name" class="ptitle" value="" maxlength="20" /></span>
+					<span class="input-text-wrap"><input type="text" name="name" class="ptitle" value="" maxlength="200" /></span>
 				</label>
 				<label>
 					<span class="title"><?php _e( 'Description', 'edit-flow' ); ?></span>
